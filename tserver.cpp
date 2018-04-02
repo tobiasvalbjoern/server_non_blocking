@@ -31,7 +31,7 @@ enum state {
 };
 
 //Stores the filedescriptors. listen on sock_fd
-int sockfd;
+int listener;
 
 void tserver_init(char * interface, char *port) {
     //Linked lists. Hints is to store our settings. servinfo is to collect
@@ -58,7 +58,7 @@ void tserver_init(char * interface, char *port) {
 
     //socket creates an endpoint for communication. 
     //Returns descriptor. -1 on error
-    if ((sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0))
+    if ((listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0))
             == -1) {
         printf("Cannot create socket\n");
         syslog(LOG_ERR, "Cannot create socket");
@@ -76,8 +76,8 @@ void tserver_init(char * interface, char *port) {
     //every packet with destination p->ai_addr should be forwarded to
     //sockfd.socket needs to be associated with a port on local machine.
     //bind sets errno to the error if it fails.
-    if (bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen) == -1) {
-        close(sockfd);
+    if (bind(listener, servinfo->ai_addr, servinfo->ai_addrlen) == -1) {
+        close(listener);
         syslog(LOG_ERR, "Cannot bind");
         printf("Cannot bind\n");
         exit(1);
@@ -89,17 +89,13 @@ void tserver_init(char * interface, char *port) {
     //sockfd is marked as passive, one used to accept incoming connection
     //requests using accept.
     //listen also sets errno on error.
-    if (listen(sockfd, BACKLOG) == -1) {
+    if (listen(listener, BACKLOG) == -1) {
         printf("Error on listen\n");
         syslog(LOG_ERR, "Error on listen");
         exit(1);
     }
 
     syslog(LOG_INFO, "server: waiting for connections...");
-
-    pthread_attr_t attr;
-
-    pthread_attr_init(&attr);
 
     // Collect tid's here
     pthread_t threads;
@@ -108,36 +104,65 @@ void tserver_init(char * interface, char *port) {
     //connection_handling = start routine
     // (void*) argument for our start routine, you can send one as a
     //void pointer.
-    int rc = pthread_create(&threads, &attr, listen_thread, NULL);
+    int rc = pthread_create(&threads, NULL, listen_thread, NULL);
     if (rc) {
         printf("Couldn't create listen thread\n");
         syslog(LOG_ERR, "Couldn't create listen thread");
         exit(-1);
     }
-
-    pthread_attr_destroy(&attr);
 }
 
 void * listen_thread(void * p) {
+
+    // master file descriptor list    
+    fd_set master;
+
+    //maximum file descriptor number
+    int fdmax;
+    
+    // clear the master and temp sets 
+    FD_ZERO(&master);
+  
+    // add the listener to the master set
+    FD_SET(listener, &master);
+
+    //keep track of the biggest file descriptor
+    // so far, it's this one        
+    fdmax = listener;
+    
+    intptr_t new_fd;
     //Endless loop that awaits connections
     while (1) {
-        //storage for the size of the connected address.
-        // connector's address information
-        struct sockaddr_storage their_addr;
-        socklen_t sin_size = sizeof (their_addr);
 
-        //intptr_t is an integer with the same size as a pointer on the system
-        intptr_t new_fd = accept(sockfd, (struct sockaddr *) &their_addr,
-                &sin_size);
-        
-        if ( new_fd == EAGAIN || new_fd == EWOULDBLOCK){
-            // The socket is marked nonblocking and no connections are
-            //present to be accepted
-            continue;
+        if (select(fdmax + 1, &master, NULL, NULL, NULL) == -1) {
+            perror("Server-select() error");
+            exit(1);
         }
         
+        //check to see if there is a new connection ready to be accepted
+        //on the listener thread.
+        if (FD_ISSET(listener, &master)) {
+            //storage for the size of the connected address.
+            // connector's address information
+            struct sockaddr_storage their_addr;
+            socklen_t sin_size = sizeof (their_addr);
+            
+            //intptr_t is an integer with the same size 
+            //as a pointer on the system
+            new_fd = accept(listener, (struct sockaddr *) &their_addr,
+                    &sin_size);
+        }
+        
+        //it should never enter here, since FD_ISSET is used as filter.
+        if (new_fd == EAGAIN || new_fd == EWOULDBLOCK) {
+            // The socket is marked nonblocking and no connections are
+            //present to be accepted
+            printf("EAGAIN\n");
+            continue;
+        }
+
         if (new_fd == -1) {
-            //printf("Could not accept\n");
+            printf("Could not accept\n");
             syslog(LOG_ERR, "Could not accept");
             continue;
         }
@@ -145,9 +170,7 @@ void * listen_thread(void * p) {
         printf("Accepted incoming connection\n");
         syslog(LOG_INFO, "Accepted incomming connection");
 
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-
+  
         // Collect tid's here
         pthread_t threads;
 
@@ -155,7 +178,7 @@ void * listen_thread(void * p) {
         //connection_handling = start routine
         // (void*) argument for our start routine, you can send one as a
         //void pointer. We send the file descriptor for the new connection.
-        int rc = pthread_create(&threads, &attr, connection_handling,
+        int rc = pthread_create(&threads, NULL, connection_handling,
                 (void*) new_fd);
         if (rc) {
             printf("Couldn't create thread\n");
@@ -163,7 +186,6 @@ void * listen_thread(void * p) {
             exit(1);
         }
 
-        pthread_attr_destroy(&attr);
     }
 
 }
