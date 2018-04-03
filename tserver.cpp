@@ -19,6 +19,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <syslog.h>
+#include <fcntl.h> /* Added for the nonblocking socket */
 
 #define BUFSIZE 1024
 #define BACKLOG 10
@@ -37,7 +38,7 @@ int listener;
 void tserver_init(char * interface, char *port) {
     //Linked lists. Hints is to store our settings. servinfo is to collect
     //information about a particular host name.
-    struct addrinfo hints, *servinfo;
+    struct addrinfo hints, *servinfo, *p;
 
     //Initialize hints.
     //Some fields we need to set.
@@ -46,15 +47,6 @@ void tserver_init(char * interface, char *port) {
     //there needs to be zero's for the "getaddrinfo" function.
     memset(&hints, 0x00, sizeof (hints));
 
-     //socket creates an endpoint for communication. 
-    //Returns descriptor. -1 on error
-    if ((listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0))
-            == -1) {
-        printf("Cannot create socket\n");
-        syslog(LOG_ERR, "Cannot create socket");
-        exit(1);
-    }
-    
     //The  hints  argument  points to an addrinfo structure that specifies
     //criteria for selecting the socket address
     //structures returned in the list pointed to by res
@@ -74,17 +66,45 @@ void tserver_init(char * interface, char *port) {
         exit(1);
     }
 
-    //every packet with destination servinfo->ai_addr should be forwarded to
-    //listener.socket needs to be associated with a port on local machine.
-    //bind sets errno to the error if it fails.
-    if (bind(listener, servinfo->ai_addr, servinfo->ai_addrlen) == -1) {
-        close(listener);
-        syslog(LOG_ERR, "Cannot bind");
-        printf("Cannot bind\n");
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        //socket creates an endpoint for communication. 
+        //Returns descriptor. -1 on error
+        if ((listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol))
+                == -1) {
+            printf("Cannot create socket\n");
+            syslog(LOG_ERR, "Cannot create socket");
+            continue;
+        }
+
+        //Indicates that the rules used in validating addresses supplied
+        //in a bind(2) call should allow reuse of local addresses.  For
+        //AF_INET sockets this means that a socket may bind, except when
+        //there is an active listening socket bound to the address.
+        //It makes it possible to close the server and restart immidiately.
+        int enable = 1;
+        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enable,
+                sizeof (int)) < 0) {
+            perror("setsockopt(SO_REUSEADDR) failed");
+        }
+        
+        //every packet with destination servinfo->ai_addr should be forwarded to
+        //listener.socket needs to be associated with a port on local machine.
+        //bind sets errno to the error if it fails.
+        if (bind(listener, p->ai_addr, p->ai_addrlen) == -1) {
+            close(listener);
+            syslog(LOG_ERR, "Cannot bind");
+            printf("Cannot bind\n");
+            continue;
+        }
+        break;
+    }
+    freeaddrinfo(servinfo);
+
+    //If the linked list has reached the end without binding.
+    if (p == NULL) {
+        syslog(LOG_ERR, "Sockfd Could not associate with port");
         exit(1);
     }
-
-    freeaddrinfo(servinfo);
 
     //Listen for connections on a socket.
     //sockfd is marked as passive, one used to accept incoming connection
@@ -95,6 +115,15 @@ void tserver_init(char * interface, char *port) {
         syslog(LOG_ERR, "Error on listen");
         exit(1);
     }
+
+    // Change the socket into non-blocking state
+    int status = fcntl(listener, F_SETFL, O_NONBLOCK);
+
+    if (status != 0) {
+        exit(1);
+    }
+
+    syslog(LOG_INFO, "Return status from fcntl: %d", status);
 
     printf("server: waiting for connections...\n");
     syslog(LOG_INFO, "server: waiting for connections...");
@@ -112,7 +141,7 @@ void tserver_init(char * interface, char *port) {
         syslog(LOG_ERR, "Couldn't create listen thread");
         exit(-1);
     }
-    pthread_join(threadid,NULL);
+    pthread_join(threadid, NULL);
 }
 
 void * listen_thread(void * p) {
@@ -248,7 +277,7 @@ void * connection_handling(void * new_fd) {
 
     //Cast back fd to an integer.
     intptr_t fd = (intptr_t) new_fd;
-    
+
     char buf_out[BUFSIZE];
 
     if (waittowrite(fd) > 0) {
@@ -294,7 +323,7 @@ void * connection_handling(void * new_fd) {
                 if (n < 0) {
                     printf("Could not write to socket\n");
                     syslog(LOG_ERR, "Could not write to socket");
-                    
+
                     done = Set;
                     //break out of the loop and test on the main while loop
                     break;
