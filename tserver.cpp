@@ -22,6 +22,7 @@
 
 #define BUFSIZE 1024
 #define BACKLOG 10
+#define S1READY 0x01
 
 void * connection_handling(void *);
 void * listen_thread(void *);
@@ -45,6 +46,15 @@ void tserver_init(char * interface, char *port) {
     //there needs to be zero's for the "getaddrinfo" function.
     memset(&hints, 0x00, sizeof (hints));
 
+     //socket creates an endpoint for communication. 
+    //Returns descriptor. -1 on error
+    if ((listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0))
+            == -1) {
+        printf("Cannot create socket\n");
+        syslog(LOG_ERR, "Cannot create socket");
+        exit(1);
+    }
+    
     //The  hints  argument  points to an addrinfo structure that specifies
     //criteria for selecting the socket address
     //structures returned in the list pointed to by res
@@ -56,15 +66,6 @@ void tserver_init(char * interface, char *port) {
     //Use my IP
     hints.ai_flags = AI_PASSIVE;
 
-    //socket creates an endpoint for communication. 
-    //Returns descriptor. -1 on error
-    if ((listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0))
-            == -1) {
-        printf("Cannot create socket\n");
-        syslog(LOG_ERR, "Cannot create socket");
-        exit(1);
-    }
-
     int rv;
     if ((rv = getaddrinfo(interface, port, &hints, &servinfo)) != 0) {
         //gai_strerror returns error code from getaddrinfo.
@@ -73,8 +74,8 @@ void tserver_init(char * interface, char *port) {
         exit(1);
     }
 
-    //every packet with destination p->ai_addr should be forwarded to
-    //sockfd.socket needs to be associated with a port on local machine.
+    //every packet with destination servinfo->ai_addr should be forwarded to
+    //listener.socket needs to be associated with a port on local machine.
     //bind sets errno to the error if it fails.
     if (bind(listener, servinfo->ai_addr, servinfo->ai_addrlen) == -1) {
         close(listener);
@@ -95,21 +96,23 @@ void tserver_init(char * interface, char *port) {
         exit(1);
     }
 
+    printf("server: waiting for connections...\n");
     syslog(LOG_INFO, "server: waiting for connections...");
 
     // Collect tid's here
-    pthread_t threads;
+    pthread_t threadid;
 
     //&threads = unique identifier for created thread.
     //connection_handling = start routine
     // (void*) argument for our start routine, you can send one as a
     //void pointer.
-    int rc = pthread_create(&threads, NULL, listen_thread, NULL);
+    int rc = pthread_create(&threadid, NULL, listen_thread, NULL);
     if (rc) {
         printf("Couldn't create listen thread\n");
         syslog(LOG_ERR, "Couldn't create listen thread");
         exit(-1);
     }
+    pthread_join(threadid,NULL);
 }
 
 void * listen_thread(void * p) {
@@ -119,26 +122,26 @@ void * listen_thread(void * p) {
 
     //maximum file descriptor number
     int fdmax;
-    
+
     // clear the master and temp sets 
     FD_ZERO(&master);
-  
+
     // add the listener to the master set
     FD_SET(listener, &master);
 
     //keep track of the biggest file descriptor
     // so far, it's this one        
     fdmax = listener;
-    
+
     intptr_t new_fd;
     //Endless loop that awaits connections
     while (1) {
 
         if (select(fdmax + 1, &master, NULL, NULL, NULL) == -1) {
-            perror("Server-select() error");
+            perror("Server-select() error in listener");
             exit(1);
         }
-        
+
         //check to see if there is a new connection ready to be accepted
         //on the listener thread.
         if (FD_ISSET(listener, &master)) {
@@ -146,13 +149,13 @@ void * listen_thread(void * p) {
             // connector's address information
             struct sockaddr_storage their_addr;
             socklen_t sin_size = sizeof (their_addr);
-            
+
             //intptr_t is an integer with the same size 
             //as a pointer on the system
             new_fd = accept(listener, (struct sockaddr *) &their_addr,
                     &sin_size);
         }
-        
+
         //it should never enter here, since FD_ISSET is used as filter.
         if (new_fd == EAGAIN || new_fd == EWOULDBLOCK) {
             // The socket is marked nonblocking and no connections are
@@ -170,7 +173,6 @@ void * listen_thread(void * p) {
         printf("Accepted incoming connection\n");
         syslog(LOG_INFO, "Accepted incomming connection");
 
-  
         // Collect tid's here
         pthread_t threads;
 
@@ -190,55 +192,116 @@ void * listen_thread(void * p) {
 
 }
 
+int waittowrite(int s1) {
+    fd_set fds;
+    int rc, result;
+
+    /* Create a descriptor set containing our two sockets.  */
+    FD_ZERO(&fds);
+    FD_SET(s1, &fds);
+
+    rc = select(sizeof (fds)*8, NULL, &fds, NULL, NULL);
+    if (rc == -1) {
+        perror("select failed");
+        return -1;
+    }
+
+    result = 0;
+    if (rc > 0) {
+        if (FD_ISSET(s1, &fds)) {
+            result |= S1READY;
+            printf("Ready to write\n");
+            syslog(LOG_INFO, "Ready to write");
+        }
+    }
+
+    return result;
+}
+
+int waittoread(int s1) {
+    fd_set fds;
+    int rc, result;
+
+    /* Create a descriptor set containing our two sockets.  */
+    FD_ZERO(&fds);
+    FD_SET(s1, &fds);
+
+    rc = select(sizeof (fds)*8, &fds, NULL, NULL, NULL);
+    if (rc == -1) {
+        perror("select failed");
+        return -1;
+    }
+
+    result = 0;
+    if (rc > 0) {
+        if (FD_ISSET(s1, &fds)) {
+            result |= S1READY;
+            printf("Ready to read\n");
+            syslog(LOG_INFO, "Ready to read");
+        }
+    }
+    return result;
+}
+
 void * connection_handling(void * new_fd) {
     enum state done = notSet;
 
     //Cast back fd to an integer.
     intptr_t fd = (intptr_t) new_fd;
-
+    
     char buf_out[BUFSIZE];
-    //No worries about strcpy, there are plenty of space
-    //in the input buffer.
-    strcpy(buf_out, "CONNECTED!\n");
-    send(fd, buf_out, strlen(buf_out), 0);
 
+    if (waittowrite(fd) > 0) {
+        //No worries about strcpy, there are plenty of space
+        //in the input buffer.
+        strcpy(buf_out, "CONNECTED!\n");
+        send(fd, buf_out, strlen(buf_out), 0);
+        printf("Sent: %s\n", buf_out);
+    }
+    int n;
     while (!done) {
         char buf_in[BUFSIZE];
 
         memset(buf_in, 0x00, strlen(buf_in));
 
-        int n = recv(fd, buf_in, sizeof (buf_in), 0);
+        if (waittoread(fd) > 0) {
+            n = recv(fd, buf_in, sizeof (buf_in), 0);
 
-        //n=0 , when the peer has performed an orderly shutdown.
-        //Therefore we need to include n=0.
-        if (n <= 0) {
-            printf("Could not read from socket\n");
-            syslog(LOG_ERR, "Could not read from socket");
-            done = Set;
-            break;
+            //n=0 , when the peer has performed an orderly shutdown.
+            //Therefore we need to include n=0.
+            if (n <= 0) {
+                printf("Could not read from socket\n");
+                syslog(LOG_ERR, "Could not read from socket");
+                done = Set;
+                break;
+            }
+
+            //End of file
+            if (buf_in[0] == 0x04) {
+                done = Set;
+                printf("Peer has performed orderly shutdown\n");
+                //break out of the loop and test on the main while loop
+                break;
+            }
+
+            printf("Received %d bytes: %s\n", n, buf_in);
+            syslog(LOG_INFO, "Received %d bytes: %s", n, buf_in);
+
+            if (waittowrite(fd) > 0) {
+                //echo the input string back to the client
+                n = send(fd, buf_in, n, 0);
+
+                if (n < 0) {
+                    printf("Could not write to socket\n");
+                    syslog(LOG_ERR, "Could not write to socket");
+                    
+                    done = Set;
+                    //break out of the loop and test on the main while loop
+                    break;
+                }
+                printf("Sent %d bytes: %s\n", n, buf_in);
+            }
         }
-        printf("Received %d bytes: %s\n", n, buf_in);
-        syslog(LOG_INFO, "Received %d bytes: %s", n, buf_in);
-
-        //End of file
-        if (buf_in[0] == 0x04) {
-            done = Set;
-            printf("Peer has performed orderly shutdown\n");
-            //break out of the loop and test on the main while loop
-            break;
-        }
-
-        //echo the input string back to the client
-        n = send(fd, buf_in, n, 0);
-        if (n < 0) {
-            printf("Could not write to socket\n");
-            syslog(LOG_ERR, "Could not write to socket");
-
-            done = Set;
-            //break out of the loop and test on the main while loop
-            break;
-        }
-
     }
     close(fd);
     return NULL;
